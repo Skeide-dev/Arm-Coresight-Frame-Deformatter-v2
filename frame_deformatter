@@ -1,0 +1,395 @@
+
+-- Short description of code
+-- Every 4 clock cycles we receive 128 bits (a full 16 byte frame) that must be decoded.
+-- It must be decoded in 4 cycles to make sure we are "ready" to receive the next frame.
+-- The first cycle is done in IDLE state once the ready signal has been received.
+-- The IDLE state only decodes 3 bytes of data, since it has to take data directly from the input wires.
+-- The other 3 states decode 4 bytes each, these use data in a shift register that acts as a "snapshot" of the data when ready was 1.
+-- Each state/clockcycle has 4 "channels", essentially it contains 4 bytes of data, 4 ID's and 4 valid signals.
+-- This ensures the next block knows which data belong to which ID, and if the data is valid or not.
+-- When decoding 3-4 bytes, we know that 2 of the bytes are either "DATA or ID", these are the "even number bytes" such as byte 0,2,4,6,8,10,12,14. The "odd" bytes are always DATA.
+-- These even number bytes are ID if it's 0th bit is 1, or Data if the 0th bit is 0.
+-- If it is an ID, the auxiliary bit corresponding to it tells us if this ID is delayed 1 byte. If the aux bit is 0, then it is not delayed and the ID change take effect immediately at the next data byte.
+-- Due to this protocol-logic, we create a case statement that handles the checking for ID or data, and deals with the logic for each case.
+-- The most "messy" logic to grasp in this code would be "new_id" and "old_id"
+-- "New_ID" refer to the last ID we had, however it is possible that this ID had it's aux bit set so that the ID change is delayed by 1 byte.
+-- This means that if our 4 byte word starts at a DATA byte instead of an ID byte, and NEW_ID was delayed, we must apply old_id to just the first DATA byte, after that the old_id can be forgotten completely.
+-- This logic then repeats itself for each state/cycle, so we must save the latest ID into NEW_ID along with the aux bit to know if it is delayed or not, we also must save the ID previous to that in the case that NEW_ID is delayed.
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+package frame_types is
+    type channel_t is record
+        data  : std_logic_vector(7 downto 0);
+        id    : std_logic_vector(6 downto 0);
+    end record;
+    
+    type channel_array is array (0 to 3) of channel_t;
+    constant NULL_CHAN : channel_t := (data => (others => '0'), id => (others => '0'));
+
+    -- the block diagram in vivado does not accept "records" so we map it over to vector, keeping the code clean and the block diagram accepts it as output is 16 bit std_logic_vector
+    -- Conversion function to keep the Block Diagram happy
+    function to_vector(c : channel_t) return std_logic_vector;
+end package; 
+
+package body frame_types is
+    function to_vector(c : channel_t) return std_logic_vector is
+    begin
+        -- Pack record into a standard 16-bit vector: [Data(8) | ID(7) | Valid(1)]
+        return c.data & '0' & c.id;
+    end function;
+end package body;
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use work.frame_types.all;
+
+entity frame_deformatter is 
+    Port ( 
+        ACLK      : in  STD_LOGIC;
+        ARESETN   : in  STD_LOGIC;
+        Frame_in  : in  STD_LOGIC_VECTOR (127 downto 0);
+        rd_en     : in  STD_LOGIC;
+        -- Every clock cycle, we output 4 bytes of data, 4 bytes ID, 1 bit valid signal nested into 16 bits.
+        Chan0     : out STD_LOGIC_VECTOR (15 downto 0); -- [Data(8) | 0 | ID(7)]
+        Chan1     : out STD_LOGIC_VECTOR (15 downto 0);
+        Chan2     : out STD_LOGIC_VECTOR (15 downto 0);
+        Chan3     : out STD_LOGIC_VECTOR (15 downto 0)
+    );
+end frame_deformatter;
+
+architecture Behavioral of frame_deformatter is
+    type state_type is (IDLE, CYCLE_A, CYCLE_B, CYCLE_C);
+    signal state : state_type := IDLE;
+
+    signal new_id            : std_logic_vector(6 downto 0) := (others => '0');
+    signal old_id            : std_logic_vector(6 downto 0) := (others => '0');
+    signal NewID_isDelayed : std_logic := '0';
+    signal error             : std_logic := '0';
+
+    type byte_array is array (0 to 14) of std_logic_vector(7 downto 0);
+    signal bytes_w, bytes_r : byte_array;
+    signal auxiliary_w, auxiliary_r : std_logic_vector(7 downto 0);
+    
+    signal chan_regs : channel_array := (others => NULL_CHAN);
+
+begin
+    -- Map internal records to the output ports using the conversion function
+    Chan0 <= to_vector(chan_regs(0));
+    Chan1 <= to_vector(chan_regs(1));
+    Chan2 <= to_vector(chan_regs(2));
+    Chan3 <= to_vector(chan_regs(3));
+    
+    -- Wiring
+    auxiliary_w <= Frame_in(127 downto 120);
+    gen_mapping: for i in 0 to 14 generate
+        bytes_w(i) <= Frame_in((i*8)+7 downto i*8);
+    end generate;
+
+    process(ACLK)
+        variable v_selector : std_logic_vector(1 downto 0);
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                state <= IDLE;
+                chan_regs <= (others => NULL_CHAN);
+                new_id <= (others => '0');
+                old_id <= (others => '0');
+                NewID_isDelayed <= '0';
+                error <= '0';
+            else
+                case state is
+                    when IDLE =>
+                        if rd_en = '1' then
+                            -- create a snapshot of the data into registers
+                            bytes_r     <= bytes_w;
+                            auxiliary_r <= auxiliary_w;
+                            
+                            -- Clear channel 3 immediately (only 3 bytes this cycle)
+                            chan_regs(3) <= NULL_CHAN;
+                            v_selector := bytes_w(2)(0) & bytes_w(0)(0);
+                            case v_selector is -- case statement for ID/DATA bytes, "1" if they are ID, "0" if they are Data
+                                when "00" => 
+                                    -- Logic for Port 0 (Handle Delay)
+                                    if NewID_isDelayed = '0' then -- was the previous ID delayed?
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => new_id);
+                                    else -- Previous ID is delayed!
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => old_id);
+                                        NewID_isDelayed <= '0'; -- an ID can only be delayed for one data byte!
+                                    end if;
+                                    -- Ports 1 and 2
+                                    chan_regs(1) <= (data => bytes_w(1), id => new_id);
+                                    chan_regs(2) <= (data => (bytes_w(2)(7 downto 1) & auxiliary_w(1)), id => new_id);
+
+
+                                when "01" => 
+                                    chan_regs(0) <= NULL_CHAN; -- byte 0 is ID
+                                    if auxiliary_w(0) = '0' then -- is Byte 0 ID Delayed ?
+                                        chan_regs(1) <= (data => bytes_w(1), id => bytes_w(0)(7 downto 1));
+                                    else -- Byte 0 ID is delayed! Use the previous ID for Byte 1!
+                                        chan_regs(1) <= (data => bytes_w(1), id => new_id);
+                                    end if;
+                                    chan_regs(2) <= (data => (bytes_w(2)(7 downto 1) & auxiliary_w(1)), id => bytes_w(0)(7 downto 1));
+                                    
+                                    -- Save snapshot of ID's so next cycle know what to do.
+                                    old_id <= new_id;
+                                    new_id <= bytes_w(0)(7 downto 1);
+                                    NewID_isDelayed <= '0'; -- since we already have gone past the id's next byte, this must be 0.
+
+
+                                when "10" => 
+                                    chan_regs(2) <= NULL_CHAN; -- Byte 2 is ID.
+                                    if NewID_isDelayed = '0' then -- was the previous ID delayed?
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => new_id);
+                                    else -- previous ID is delayed!
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => old_id);
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_w(1), id => new_id);
+
+                                    -- save ID snapshot for next cycle
+                                    old_id <= new_id;
+                                    new_id <= bytes_w(2)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_w(1); -- aux bits tell if ID's are delayed or not!
+                                    
+
+                                when "11" =>
+
+                                    chan_regs(0) <= NULL_CHAN; -- byte 0 is ID
+                                    chan_regs(2) <= NULL_CHAN; -- byte 2 is ID
+
+                                    if auxiliary_w(0) = '0' then -- is byte 0 ID delayed?
+                                        chan_regs(1) <= (data => bytes_w(1), id => bytes_w(0)(7 downto 1));
+                                    else -- byte 0 ID is delayed!
+                                        chan_regs(1) <= (data => bytes_w(1), id => new_id);
+                                    end if;
+
+                                    -- save ID snapshot for next cycle
+                                    old_id <= bytes_w(0)(7 downto 1);
+                                    new_id <= bytes_w(2)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_w(1); -- aux(1) tells next cycle if byte 2 is delayed or not!
+                                    -- Note, if byte 0 was delayed, and byte 2 is not, then byte 0 ID is overriden by byte 2 and lost. Should be an impossible "case" that the TPIU formatter has accounted for.
+
+                                when others => error <= '1'; -- Handles "U" "X" "Z" values, undefined values means something bad happened!
+                            end case;
+                        state <= CYCLE_A;-- Note: in the next cycles we will always decode 4 bytes instead of 3. This should help split the amount of logic gates across each cycle, since in IDLE state we also check for rd_en.
+                        end if;
+
+
+                    when CYCLE_A => -- Bytes 3, 4, 5, 6
+                                v_selector := bytes_r(6)(0) & bytes_r(4)(0);
+                                case v_selector is -- must use integer for the case definition here so vivado will allow the syntax
+                                when "00" => 
+                                    if NewID_isDelayed = '0' then -- Is the new_ID (byte 2) delayed ?
+                                        chan_regs(0) <= (data => bytes_r(3), id => new_id);
+                                    else
+                                        chan_regs(0) <= (data => bytes_r(3), id => old_id);
+                                        NewID_isDelayed <= '0'; 
+                                    end if;
+                                    chan_regs(1) <= (data => (bytes_r(4)(7 downto 1) & auxiliary_r(2)), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(5), id => new_id);
+                                    chan_regs(3) <= (data => (bytes_r(6)(7 downto 1) & auxiliary_r(3)), id => new_id);
+
+
+                                when "01" => -- hardest case iv had due to a impossible situation here!
+                                    chan_regs(1) <= NULL_CHAN; -- byte4 is ID
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 2) delayed?
+                                        chan_regs(0) <= (data => bytes_r(3), id => new_id);
+                                    else -- new_ID (byte 2) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(3), id => old_id);
+                                    end if;
+                                    if auxiliary_r(2) = '0' then -- is byte 4 ID delayed?
+                                        chan_regs(2) <= (data => bytes_r(5), id => bytes_r(4)(7 downto 1)); -- Note: since new_id was delayed, but byte 4 ID was not, new_id is completely lost here. This is correct handling of the protocol for this case.
+                                    else  -- byte 4 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(5), id => new_id);
+                                    end if;
+                                    chan_regs(3) <= (data => bytes_r(6)(7 downto 1) & auxiliary_r(3), id => bytes_r(4)(7 downto 1));
+                                    old_id <= new_id;
+                                    new_id <= bytes_r(4)(7 downto 1);
+                                    NewID_isDelayed <= '0'; -- since we already have gone past the id's next byte, this must be 0.
+
+                                when "10" =>
+                                    chan_regs(3) <= NULL_CHAN; -- byte 6 is an id
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 2) delayed?
+                                        chan_regs(0) <= (data => bytes_r(3), id => new_id);
+                                    else -- new_ID (byte 2) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(3), id => old_id);
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_r(4)(7 downto 1) & auxiliary_r(2), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(5), id => new_id);
+
+                                    old_id <= new_id;------------------------------
+                                    new_id <= bytes_r(6)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(3);
+                                when "11" =>
+                                    chan_regs(1) <= NULL_CHAN; -- byte 4 is ID
+                                    chan_regs(3) <= NULL_CHAN; -- byte 6 is ID
+
+                                    if NewID_isDelayed = '0' then -- Is new_ID delayed?
+                                        chan_regs(0) <= (data => bytes_r(3), id => new_id);
+                                    else -- new_ID is delayed!
+                                        chan_regs(0) <= (data => bytes_r(3), id => old_id);
+                                    end if;
+                                    if auxiliary_r(2) = '0' then -- is byte 4 id delayed?
+                                        chan_regs(2) <= (data => bytes_r(5), id => bytes_r(4)(7 downto 1));
+                                    else -- byte 4 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(5), id => new_id);
+                                    end if;
+
+                                    old_id <= bytes_r(4)(7 downto 1);
+                                    new_id <= bytes_r(6)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(3);
+                                when others =>
+                                    error <= '1';
+                                end case;
+                        state <= CYCLE_B;
+
+                    when CYCLE_B => -- Bytes 7, 8, 9, 10
+                                v_selector := bytes_r(10)(0) & bytes_r(8)(0);
+                                case v_selector is
+                                when "00" => 
+                                    if NewID_isDelayed = '0' then -- Is the new_ID (byte 6) delayed ?
+                                        chan_regs(0) <= (data => bytes_r(7), id => new_id);
+                                    else
+                                        chan_regs(0) <= (data => bytes_r(7), id => old_id);
+                                        NewID_isDelayed <= '0'; 
+                                    end if;
+                                    chan_regs(1) <= (data => (bytes_r(8)(7 downto 1) & auxiliary_r(4)), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(9), id => new_id);
+                                    chan_regs(3) <= (data => (bytes_r(10)(7 downto 1) & auxiliary_r(5)), id => new_id);
+
+
+                                when "01" => -- hardest case iv had due to a impossible situation here!
+                                    chan_regs(1) <= NULL_CHAN; -- byte 8 is ID
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 6) delayed?
+                                        chan_regs(0) <= (data => bytes_r(7), id => new_id);
+                                    else -- new_ID (byte 6) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(7), id => old_id);
+                                    end if;
+                                    if auxiliary_r(4) = '0' then -- is byte 8 ID immediate?
+                                        chan_regs(2) <= (data => bytes_r(9), id => bytes_r(8)(7 downto 1));
+                                    else -- byte 4 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(9), id => new_id);
+                                    end if;
+                                    chan_regs(3) <= (data => bytes_r(10)(7 downto 1) & auxiliary_r(5), id => bytes_r(8)(7 downto 1));
+
+                                    old_id <= new_id;
+                                    new_id <= bytes_r(8)(7 downto 1);
+                                    NewID_isDelayed <= '0'; -- since we already have gone past the id's next byte, this must be 0.
+
+                                when "10" =>
+                                    chan_regs(3) <= NULL_CHAN; -- byte 10 is an id
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 6) delayed?
+                                        chan_regs(0) <= (data => bytes_r(7), id => new_id);
+                                    else -- new_ID (byte 6) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(7), id => old_id);
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_r(8)(7 downto 1) & auxiliary_r(4), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(9), id => new_id);
+
+                                    old_id <= new_id;------------------------------
+                                    new_id <= bytes_r(10)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(5);
+                                when "11" =>
+                                    chan_regs(1) <= NULL_CHAN; -- byte 8 is ID
+                                    chan_regs(3) <= NULL_CHAN; -- byte 10 is ID
+
+                                    if NewID_isDelayed = '0' then -- Is new_ID delayed?
+                                        chan_regs(0) <= (data => bytes_r(7), id => new_id);
+                                    else -- new_ID is delayed!
+                                        chan_regs(0) <= (data => bytes_r(7), id => old_id);
+                                    end if;
+                                    if auxiliary_r(4) = '0' then -- is byte 8 id delayed?
+                                        chan_regs(2) <= (data => bytes_r(9), id => bytes_r(8)(7 downto 1));
+                                    else -- byte 8 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(9), id => new_id);
+                                    end if;
+
+                                    old_id <= bytes_r(8)(7 downto 1);
+                                    new_id <= bytes_r(10)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(5);
+                                when others =>
+                                    error <= '1';
+                                end case;
+                        state <= CYCLE_C;
+
+                    when CYCLE_C => -- Bytes 11, 12, 13, 14
+                                v_selector := bytes_r(14)(0) & bytes_r(12)(0);
+                                case v_selector is
+                                when "00" => 
+                                    if NewID_isDelayed = '0' then -- Is the new_ID (byte 10) delayed ?
+                                        chan_regs(0) <= (data => bytes_r(11), id => new_id);
+                                    else
+                                        chan_regs(0) <= (data => bytes_r(11), id => old_id);
+                                        NewID_isDelayed <= '0'; 
+                                    end if;
+                                    chan_regs(1) <= (data => (bytes_r(12)(7 downto 1) & auxiliary_r(6)), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(13), id => new_id);
+                                    chan_regs(3) <= (data => (bytes_r(14)(7 downto 1) & auxiliary_r(7)), id => new_id);
+
+
+                                when "01" => -- hardest case iv had due to a impossible situation here!
+                                    chan_regs(1) <= NULL_CHAN; -- byte 12 is ID
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 10) delayed?
+                                        chan_regs(0) <= (data => bytes_r(11), id => new_id);
+                                    else -- new_ID (byte 6) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(11), id => old_id);                                    
+                                    end if;
+                                    if auxiliary_r(6) = '0' then -- is byte 12 ID delayed?
+                                        chan_regs(2) <= (data => bytes_r(13), id => bytes_r(12)(7 downto 1));
+                                    else -- byte 12 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(13), id => new_id);
+                                    end if;
+                                    chan_regs(3) <= (data => bytes_r(14)(7 downto 1) & auxiliary_r(7), id => bytes_r(12)(7 downto 1));
+
+                                    old_id <= new_id;
+                                    new_id <= bytes_r(12)(7 downto 1);
+                                    NewID_isDelayed <= '0'; -- since we already have gone past the id's next byte, this must be 0.
+
+                                when "10" =>
+                                    chan_regs(3) <= NULL_CHAN; -- byte 10 is an id
+
+                                    if NewID_isDelayed = '0' then -- is new_ID (byte 10) delayed?
+                                        chan_regs(0) <= (data => bytes_r(11), id => new_id);
+                                    else -- new_ID (byte 10) is delayed!
+                                        chan_regs(0) <= (data => bytes_r(11), id => old_id);
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_r(12)(7 downto 1) & auxiliary_r(6), id => new_id);
+                                    chan_regs(2) <= (data => bytes_r(13), id => new_id);
+
+                                    old_id <= new_id;------------------------------
+                                    new_id <= bytes_r(14)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(7);
+                                when "11" =>
+                                    chan_regs(1) <= NULL_CHAN; -- byte 12 is ID
+                                    chan_regs(3) <= NULL_CHAN; -- byte 14 is ID
+
+                                    if NewID_isDelayed = '0' then -- Is new_ID delayed?
+                                        chan_regs(0) <= (data => bytes_r(11), id => new_id);
+                                    else -- new_ID is delayed!
+                                        chan_regs(0) <= (data => bytes_r(11), id => old_id);
+                                    end if;
+                                    if auxiliary_r(6) = '0' then -- is byte 12 id delayed?
+                                        chan_regs(2) <= (data => bytes_r(13), id => bytes_r(12)(7 downto 1));
+                                    else -- byte 12 ID is delayed!
+                                        chan_regs(2) <= (data => bytes_r(13), id => new_id);
+                                    end if;
+
+                                    old_id <= bytes_r(12)(7 downto 1);
+                                    new_id <= bytes_r(14)(7 downto 1);
+                                    NewID_isDelayed <= auxiliary_r(7);
+                                when others =>
+                                    error <= '1';
+                                end case;
+                        state <= IDLE;
+
+                    when others => state <= IDLE;
+                end case;
+            end if;
+        end if;
+    end process;
+end Behavioral;
