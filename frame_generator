@@ -1,0 +1,73 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity frame_generator is
+    Port (
+        ACLK        : in  STD_LOGIC;
+        ARESETN     : in  STD_LOGIC;
+        trace_data  : in  STD_LOGIC_VECTOR(31 downto 0);
+        frame       : out STD_LOGIC_VECTOR(127 downto 0);
+        rd_en       : out STD_LOGIC
+    );
+end frame_generator;
+
+architecture Behavioral of frame_generator is
+    signal frame_reg : std_logic_vector(127 downto 0);
+    constant SYNC_PATTERN : std_logic_vector(31 downto 0) := X"7FFFFFFF";
+    constant HALFWORD     : std_logic_vector(31 downto 0) := X"7FFF7FFF";
+    signal   count        : unsigned(1 downto 0)          := "00";
+    signal   error        : STD_LOGIC                     := '0';
+
+    -- State machine
+    type state_type is (IDLE, ACTIVE);
+    signal state      : state_type := IDLE;
+    signal idle_count : unsigned(1 downto 0) := "00";
+
+begin
+
+    frame <= frame_reg;
+
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                rd_en      <= '0';
+                count      <= "00";
+                error      <= '0';
+                state      <= IDLE;
+                idle_count <= "00";
+            else
+                case state is
+
+                when IDLE => -- For block memory generator simulation only. Skips the first block memory synchronization word!
+                        rd_en <= '0';
+                        state <= ACTIVE;
+
+
+                    when ACTIVE =>
+                        rd_en <= '0';
+                        if trace_data /= SYNC_PATTERN then
+                            if trace_data /= HALFWORD then
+                                frame_reg <= trace_data & frame_reg(127 downto 32);
+                                if count = "11" then
+                                    rd_en <= '1';
+                                    count <= "00";
+                                else
+                                    count <= count + 1;
+                                end if;
+                            end if;
+                        else
+                            if count /= "00" then
+                                error <= '1';
+                            else
+                                error <= '0';
+                            end if;
+                        end if;
+
+                end case;
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
