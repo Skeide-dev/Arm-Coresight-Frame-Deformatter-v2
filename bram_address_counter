@@ -1,0 +1,28 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity bram_address_counter is
+    Port (
+        clk         : in std_logic;
+        ARESETN     : in std_logic;
+        bram_addr   : out std_logic_vector(13 downto 0)
+    );
+end bram_address_counter;
+
+architecture Behavioral of bram_address_counter is
+    signal addr : unsigned(13 downto 0) := (others => '0');
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if ARESETN = '0' then
+                addr <= (others => '0');
+            else
+                addr <= addr + 1;
+            end if;
+        end if;
+    end process;
+    
+    bram_addr <= std_logic_vector(addr);
+end Behavioral;
